@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+
+# --- jj-select ---
+# A minimalistic TUI utility for Jujutsu (jj).
+#
+# Unlike full-blown TUI clients that take over your terminal, jj-select is
+# designed to be lightweight and focused. It reduces mental load by replacing
+# manual ID lookups with interactive selection, using stable, colorful icons
+# to anchor your workflow against the shifting graph layouts of 'jj log'.
+#
+# Note: For complex root stacks that branch into many separate heads, the
+# default linear TUI formatting might be hard to parse. In these cases,
+# use the 'log' mode (which enables graph lines) or add the '-n' flag
+# (to restore standard jj formatting) for better visualization.
+#
+# Installation:
+#   1. Save as 'jj-select' and make executable: chmod +x jj-select
+#   2. Move to your PATH (e.g. ~/.local/bin)
+#   3. Register alias:
+#      jj config set --user aliases.select '["util", "exec", "--", "jj-select"]'
+#
+# Usage Examples:
+#   jj select                   # Select from stack -> edit (defaults)
+#   jj select new heads         # Select from mutable heads -> create child
+#   jj select rebase -t fzf     # Rebase @ and descendants onto selection
+#   jj select log abandon       # Select from full graph -> abandon
+#
+#   jj select show custom 'files("BUILD")' BUILD
+#       # Select from revs touching 'BUILD', then show diff for that file only.
+#
+#   jj select rebase remotes -p staging,snap -b main
+#       # Rebase @ onto remote. Skip 'staging*/snap*', pre-select 'main'.
+#
+#   jj select show custom "mine() & immutable()" --stat
+#       # Select from upstream revs and pass --stat to 'jj show'.
+#
+#   jj select edit --silent --quiet
+#       # Edit selection. Suppress script output ('Running...') AND 'jj' output.
+# -----------------
+
+# --- Configuration & Defaults ---
+# 1. TUI Backend
+TUI_BACKEND="${JJ_SELECT_BACKEND:-gum}"
+
+# 2. Tmux Binary & Options
+TMUX_BIN="${TMUX_BINARY:-${JJ_SELECT_TMUX_BINARY:-tmx2}}"
+TMUX_POPUP_OPTS="${JJ_SELECT_TMUX_POPUP_OPTS:- -w 80% -h 80%}"
+
+# 3. FZF Options (Visuals Only)
+FZF_USER_OPTS="${JJ_SELECT_FZF_OPTS:- --height=20%}"
+
+# 4. Script Silence (Echo Suppression)
+# Set to "true" to stop the script from printing "Running: jj ...".
+# This does NOT pass --quiet to jj. To quiet jj, pass -q manually.
+SCRIPT_SILENT="${JJ_SELECT_SILENT:-false}"
+
+# 5. Icon Pack
+ICON_HEADS="${JJ_SELECT_ICON_HEADS:-🌿}"
+ICON_STACK="${JJ_SELECT_ICON_STACK:-🪜}"
+ICON_ROOTS="${JJ_SELECT_ICON_ROOTS:-🪵}"
+ICON_REMOTE="${JJ_SELECT_ICON_REMOTE:-☁️ }"
+ICON_TAG="${JJ_SELECT_ICON_TAG:-🏷️}"
+ICON_CONFLICT="${JJ_SELECT_ICON_CONFLICT:-❌}"
+
+# 6. Runtime Defaults
+ACTION="edit"   # Default action
+MODE="stack"    # Default mode
+ARG=""
+SKIP_PREFIXES=""
+PRESELECT_REVSET="@"
+EXTRA_ARGS=()
+SHOW_GRAPH="false"
+USE_TEMPLATE="true"
+DRY_RUN="false"
+CUSTOM_REVSET=""
+
+# --- Visual Styling Helpers ---
+C_RED="\033[0;31m"
+C_GREEN="\033[0;32m"
+C_YELLOW="\033[0;33m"
+C_BOLD_GREEN="\033[1;32m"
+C_BOLD="\033[1m"
+C_RESET="\033[0m"
+
+show_error() {
+  local MSG="$1"
+  echo -e "${C_RED}error:${C_GREEN} ${MSG}${C_RESET}"
+  echo ""
+  echo -e "${C_YELLOW}Usage:${C_RESET} ${C_BOLD_GREEN}jj select${C_RESET}" \
+          "${C_GREEN}[MODE] [COMMAND] [OPTIONS] [JJ_FLAGS...]${C_RESET}"
+  echo ""
+  echo -e "For more information, try '${C_GREEN}--help${C_RESET}'."
+  exit 1
+}
+
+# --- Help Menu ---
+show_help() {
+  echo "Select a revision via TUI and execute a command"
+  echo ""
+  echo -e "${C_YELLOW}Usage:${C_RESET} ${C_BOLD_GREEN}jj select${C_RESET}" \
+          "${C_GREEN}[MODE] [COMMAND] [OPTIONS] [JJ_FLAGS...]${C_RESET}"
+  echo ""
+
+  # --- Formatting Constants ---
+  local W_OPT=24
+  local W_CMD=12
+
+  local FMT_OPT="  ${C_BOLD_GREEN}%-${W_OPT}s${C_RESET} %s\n"
+  local FMT_CMD="  ${C_BOLD_GREEN}%-${W_CMD}s${C_RESET} %s\n"
+  local FMT_CMD_B="  ${C_BOLD_GREEN}%-${W_CMD}s${C_RESET} %s\n"
+
+  echo -e "${C_YELLOW}Modes:${C_RESET} (Optional, defaults to 'stack')"
+  printf "$FMT_CMD" "stack"      "Current stack (ancestors/descendants of @)"
+  printf "$FMT_CMD" "heads"      "All mutable heads"
+  printf "$FMT_CMD" "roots"      "All mutable roots"
+  printf "$FMT_CMD" "bookmarks"  "All mutable bookmarks"
+  printf "$FMT_CMD" "remotes"    "All remote bookmarks"
+  printf "$FMT_CMD" "log"        "Default graph view (visible revisions)"
+  printf "$FMT_CMD" "custom"     "Use with a positional argument for revset"
+  echo ""
+
+  echo -e "${C_YELLOW}Commands:${C_RESET} (Optional, defaults to 'edit')"
+  printf "$FMT_CMD_B" "edit"      "Switch to the selected revision"
+  printf "$FMT_CMD_B" "new"       "Create a child of the selected revision"
+  printf "$FMT_CMD_B" "rebase"    "Rebase working copy (@) & descendants onto selection"
+  printf "$FMT_CMD_B" "duplicate" "Create a copy of the selected revision"
+  printf "$FMT_CMD_B" "abandon"   "Abandon the selected revision"
+  printf "$FMT_CMD_B" "evolog"    "Show the event log for the revision"
+  printf "$FMT_CMD_B" "show"      "Show commit details (diff & description)"
+  echo ""
+
+  echo -e "${C_YELLOW}Options:${C_RESET}"
+  printf "$FMT_OPT" "-d, --days <N>"        "Show revisions from last N days"
+  printf "$FMT_OPT" "-p, --skip-prefix <L>" "Skip bookmarks with these prefixes"
+  printf "$FMT_OPT" "-b, --bookmark <NAME>" "Pre-select this bookmark"
+  printf "$FMT_OPT" "-t, --tui <BACKEND>"   "Backend: gum, fzf, gum_tmux, fzf_tmux"
+  printf "$FMT_OPT" ""                      "(tmux backends open in a popup)"
+  printf "$FMT_OPT" "-n, --no-template"     "Use native jj template instead of TUI"
+  printf "$FMT_OPT" "    --dry-run"         "Print command instead of executing"
+  printf "$FMT_OPT" "    --silent"          "Don't print 'Running: ...' line"
+  printf "$FMT_OPT" "-h, --help"            "Print help"
+  echo ""
+
+  echo -e "${C_YELLOW}JJ Flags:${C_RESET}"
+  echo "  Any unrecognized options (e.g. -q, --stat) are passed to jj."
+  exit 0
+}
+
+# --- 1. Smart Argument Parsing ---
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    # --- Modes ---
+    stack|heads|roots|bookmarks|remotes|log|custom)
+      MODE="$1"
+      ;;
+
+    # --- Commands ---
+    edit|new|rebase|show|duplicate|abandon|evolog)
+      ACTION="$1"
+      ;;
+
+    # --- Options (Flags with Arguments) ---
+    -d|--days)        ARG="$2"; shift ;;
+    -p|--skip-prefix) SKIP_PREFIXES="$2"; shift ;;
+    -b|--bookmark)
+      PRESELECT_REVSET="bookmarks(\"$2\") | remote_bookmarks(\"$2\")"
+      shift
+      ;;
+    -t|--tui)         TUI_BACKEND="$2"; shift ;;
+
+    # --- Options (Flags without Arguments) ---
+    -n|--no-template) USE_TEMPLATE="false" ;;
+    --dry-run)        DRY_RUN="true" ;;
+    --silent)         SCRIPT_SILENT="true" ;;
+    -h|--help)        show_help ;;
+
+    # --- Pass-through ---
+    *) EXTRA_ARGS+=("$1") ;;
+  esac
+  shift
+done
+
+# --- 1b. Handle Positional Custom Revsets ---
+# If mode is custom, we assume the first unknown argument (EXTRA_ARGS[0])
+# is the revset string.
+if [[ "$MODE" == "custom" && ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+  CUSTOM_REVSET="${EXTRA_ARGS[0]}"
+  # Remove the first element (the revset) from EXTRA_ARGS
+  # leaving remaining args (like --stat, or file paths) for the final command
+  EXTRA_ARGS=("${EXTRA_ARGS[@]:1}")
+fi
+
+# --- 2. Dependency Check ---
+if [[ "$TUI_BACKEND" == *"gum"* ]] && ! command -v gum &> /dev/null; then
+  show_error "dependency 'gum' not found."
+fi
+if [[ "$TUI_BACKEND" == *"fzf"* ]] && ! command -v fzf &> /dev/null; then
+  show_error "dependency 'fzf' not found."
+fi
+if [[ "$TUI_BACKEND" == *"tmux"* ]] && ! command -v "$TMUX_BIN" &> /dev/null; then
+  show_error "dependency '$TMUX_BIN' not found."
+fi
+
+# --- 3. Build Filters & Template ---
+T_FILTER_LOCAL="true"
+REVSET_EXCLUDE="none()"
+
+if [[ -n "$SKIP_PREFIXES" ]]; then
+  IFS=',' read -ra PREFIX_LIST <<< "$SKIP_PREFIXES"
+  for p in "${PREFIX_LIST[@]}"; do
+    T_FILTER_LOCAL="${T_FILTER_LOCAL} && !b.name().starts_with(\"$p\")"
+    REVSET_EXCLUDE="${REVSET_EXCLUDE} | bookmarks(\"$p*\") |"
+    REVSET_EXCLUDE+=" remote_bookmarks(\"$p*\")"
+  done
+fi
+# We use escaped double quotes here to be safe within the JJ template string
+T_FILTER_REMOTE="${T_FILTER_LOCAL} && b.remote() != \"git\""
+
+# Construct T_ICON safely using a single double-quoted block.
+# We escape internal double quotes (\") but allow variable expansion ($VAR).
+T_ICON="if(self.contained_in(\"heads(mutable())\"), \"$ICON_HEADS\","
+T_ICON+=" if(remote_bookmarks.filter(|b| $T_FILTER_REMOTE),"
+T_ICON+=" \"$ICON_REMOTE\","
+T_ICON+=" if(self.parents().all(|p| p.immutable()), \"$ICON_ROOTS\","
+T_ICON+=" \"$ICON_STACK\")))"
+T_ICON+=" ++ \" \""
+
+T_ID='change_id.shortest(12) ++ " "'
+
+T_STATUS='label("current",  if(current_working_copy, "@", "")) ++ '
+T_STATUS+='label("conflict", if(conflict, "'"$ICON_CONFLICT"'", "")) ++ '
+T_STATUS+='if(!conflict && !current_working_copy, " ") ++ " "'
+
+T_TIME='label("timestamp", pad_end(11, committer.timestamp().ago())) ++ " "'
+
+# Construct T_MARKS safely using double quotes to wrap the filters
+BM_FLT="bookmarks.filter(|b| $T_FILTER_LOCAL).map(|b|"
+BM_FMT="label(\"bookmark\", \"$ICON_TAG\" ++ \" \" ++ b.name())).join(\" \")"
+
+T_MARKS="$BM_FLT $BM_FMT ++"
+T_MARKS+=" if(bookmarks.filter(|b| $T_FILTER_LOCAL), \"  \")"
+
+T_DESC='description.first_line() ++ "\n"'
+
+TEMPLATE="${T_ICON} ++ ${T_ID} ++ ${T_STATUS} ++ ${T_TIME}"
+TEMPLATE+=" ++ ${T_MARKS} ++ ${T_DESC}"
+
+apply_date() {
+  [[ -n "$ARG" ]] && echo " & committer_date(after:\"$ARG days ago\")"
+}
+
+case $MODE in
+  stack)     REVSET='mutable() & (::@ | @::)' ; REVSET+=$(apply_date) ;;
+  heads)     REVSET="heads(mutable())" ; REVSET+=$(apply_date) ;;
+  roots)     REVSET="roots(mutable())" ; REVSET+=$(apply_date) ;;
+  bookmarks)
+    REVSET="(bookmarks() & mutable()" ; REVSET+=$(apply_date)
+    REVSET+=") ~ ($REVSET_EXCLUDE)"
+    ;;
+  remotes)
+    REVSET="(remote_bookmarks()" ; REVSET+=$(apply_date)
+    REVSET+=") ~ ($REVSET_EXCLUDE)"
+    ;;
+  log)
+    REVSET="" ; REVSET+=$(apply_date) ; SHOW_GRAPH="true"
+    ;;
+  custom)
+    REVSET="${CUSTOM_REVSET}"
+    REVSET+=$(apply_date)
+    SHOW_GRAPH="false"
+    ;;
+  *) show_error "Unknown mode: $MODE" ;;
+esac
+
+# --- 4. Fetch & Prepare Data ---
+TMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'jj-select')
+trap "rm -rf $TMP_DIR" EXIT
+
+TMP_LIST="$TMP_DIR/list"
+TMP_OUT="$TMP_DIR/out"
+
+TARGET_ID=$(jj log --no-graph --color=never -r "$PRESELECT_REVSET" \
+  -T 'change_id.shortest(12)' 2>/dev/null | head -n 1)
+
+CMD_ARGS=("log" "--color=always")
+if [[ -n "$REVSET" ]]; then CMD_ARGS+=("-r" "$REVSET"); fi
+if [[ "$USE_TEMPLATE" == "true" ]]; then CMD_ARGS+=("-T" "$TEMPLATE"); fi
+if [[ "$SHOW_GRAPH" == "false" ]]; then CMD_ARGS+=("--no-graph"); fi
+
+RAW_OUTPUT=$(jj "${CMD_ARGS[@]}" | sed 's/,/ /g')
+
+if [[ -z "$RAW_OUTPUT" ]]; then
+  # Only print this message if script is not silenced
+  [[ "$SCRIPT_SILENT" != "true" ]] && echo "No revisions found for '$MODE'."
+  exit 0
+fi
+
+SELECTED_LINE=""
+if [[ -n "$TARGET_ID" ]]; then
+  CLEAN_OUTPUT=$(echo "$RAW_OUTPUT" | sed 's/\x1b\[[0-9;]*m//g')
+  LINE_NUM=$(echo "$CLEAN_OUTPUT" | grep -nF "$TARGET_ID" \
+      | head -n 1 | cut -d: -f1)
+  if [[ -n "$LINE_NUM" ]]; then
+    SELECTED_LINE=$(echo "$RAW_OUTPUT" | sed -n "${LINE_NUM}p")
+  fi
+fi
+
+echo "$RAW_OUTPUT" > "$TMP_LIST"
+
+# --- 5. TUI Execution ---
+HEADER="Select Revision from $MODE to $ACTION"
+COMMIT_LINE=""
+FZF_CMD_OPTS="--ansi --no-sort --layout=reverse $FZF_USER_OPTS"
+
+case $TUI_BACKEND in
+  gum)
+    if [[ -n "$SELECTED_LINE" ]]; then
+      COMMIT_LINE=$(echo "$RAW_OUTPUT" | gum choose --header "$HEADER" \
+        --height 20 --selected "$SELECTED_LINE")
+    else
+      COMMIT_LINE=$(echo "$RAW_OUTPUT" | gum choose --header "$HEADER" \
+        --height 20)
+    fi
+    ;;
+
+  gum_tmux)
+    GUM_CMD="gum choose --header '$HEADER'"
+    if [[ -n "$SELECTED_LINE" ]]; then
+      SAFE_SEL=$(echo "$SELECTED_LINE" | sed 's/"/\\"/g')
+      GUM_CMD="$GUM_CMD --selected \"$SAFE_SEL\""
+    fi
+    "$TMUX_BIN" display-popup -E $TMUX_POPUP_OPTS \
+      "cat $TMP_LIST | $GUM_CMD > $TMP_OUT"
+    [[ -f "$TMP_OUT" ]] && COMMIT_LINE=$(cat "$TMP_OUT")
+    ;;
+
+  fzf)
+    COMMIT_LINE=$(echo "$RAW_OUTPUT" | fzf --header "$HEADER" $FZF_CMD_OPTS)
+    ;;
+
+  fzf_tmux)
+    "$TMUX_BIN" display-popup -E $TMUX_POPUP_OPTS \
+      "cat $TMP_LIST | fzf --header '$HEADER' $FZF_CMD_OPTS > $TMP_OUT"
+    [[ -f "$TMP_OUT" ]] && COMMIT_LINE=$(cat "$TMP_OUT")
+    ;;
+
+  *) show_error "Unknown backend: $TUI_BACKEND" ;;
+esac
+
+if [[ -z "$COMMIT_LINE" ]]; then exit 0; fi
+
+# --- 6. Execute Action ---
+CLEAN_LINE=$(echo "$COMMIT_LINE" | sed 's/\x1b\[[0-9;]*m//g')
+COMMIT_ID=$(echo "$CLEAN_LINE" | grep -oE '[a-z0-9]{8,32}' | head -n 1)
+
+if [[ -z "$COMMIT_ID" ]]; then
+  show_error "Could not find Commit ID in selection."
+fi
+
+CMD_TO_RUN=()
+
+case "$ACTION" in
+  edit)       CMD_TO_RUN=("jj" "edit" "$COMMIT_ID") ;;
+  new)        CMD_TO_RUN=("jj" "new" "$COMMIT_ID") ;;
+  rebase)     CMD_TO_RUN=("jj" "rebase" "-s" "@" "-d" "$COMMIT_ID") ;;
+  duplicate)  CMD_TO_RUN=("jj" "duplicate" "$COMMIT_ID") ;;
+  abandon)    CMD_TO_RUN=("jj" "abandon" "$COMMIT_ID") ;;
+  evolog)     CMD_TO_RUN=("jj" "evolog" "$COMMIT_ID") ;;
+  show)       CMD_TO_RUN=("jj" "show" "$COMMIT_ID") ;;
+  *)          show_error "Unknown action: $ACTION" ;;
+esac
+
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+  CMD_TO_RUN+=("${EXTRA_ARGS[@]}")
+fi
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  echo "${CMD_TO_RUN[*]}"
+else
+  # Print command if not silenced
+  [[ "$SCRIPT_SILENT" != "true" ]] && echo "Running: ${CMD_TO_RUN[*]} ..."
+  "${CMD_TO_RUN[@]}"
+fi
