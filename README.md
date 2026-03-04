@@ -103,6 +103,7 @@ Commands: (Optional, defaults to 'edit')
   rebase       Rebase working copy (@) & descendants onto selection
   duplicate    Create a copy of the selected revision
   abandon      Abandon the selected revision
+  restore      Restore files from the selected revision
   evolog       Show the event log for the revision
   show         Show commit details (diff & description)
 
