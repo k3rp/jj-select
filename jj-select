@@ -24,6 +24,7 @@
 #   jj select new heads         # Select from mutable heads -> create child
 #   jj select rebase -t fzf     # Rebase @ and descendants onto selection
 #   jj select log abandon       # Select from full graph -> abandon
+#   jj select restore log       # Select from full graph -> restore files
 #
 #   jj select show custom 'files("BUILD")' BUILD
 #       # Select from revs touching 'BUILD', then show diff for that file only.
@@ -125,6 +126,7 @@ show_help() {
   printf "$FMT_CMD_B" "rebase"    "Rebase working copy (@) & descendants onto selection"
   printf "$FMT_CMD_B" "duplicate" "Create a copy of the selected revision"
   printf "$FMT_CMD_B" "abandon"   "Abandon the selected revision"
+  printf "$FMT_CMD_B" "restore"   "Restore files from the selected revision"
   printf "$FMT_CMD_B" "evolog"    "Show the event log for the revision"
   printf "$FMT_CMD_B" "show"      "Show commit details (diff & description)"
   echo ""
@@ -155,7 +157,7 @@ while [[ "$#" -gt 0 ]]; do
       ;;
 
     # --- Commands ---
-    edit|new|rebase|show|duplicate|abandon|evolog)
+    edit|new|rebase|show|duplicate|abandon|restore|evolog)
       ACTION="$1"
       ;;
 
@@ -365,6 +367,7 @@ case "$ACTION" in
   rebase)     CMD_TO_RUN=("jj" "rebase" "-s" "@" "-d" "$COMMIT_ID") ;;
   duplicate)  CMD_TO_RUN=("jj" "duplicate" "$COMMIT_ID") ;;
   abandon)    CMD_TO_RUN=("jj" "abandon" "$COMMIT_ID") ;;
+  restore)    CMD_TO_RUN=("jj" "restore" "--from" "$COMMIT_ID") ;;
   evolog)     CMD_TO_RUN=("jj" "evolog" "$COMMIT_ID") ;;
   show)       CMD_TO_RUN=("jj" "show" "$COMMIT_ID") ;;
   *)          show_error "Unknown action: $ACTION" ;;
