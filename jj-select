@@ -317,16 +317,16 @@ FZF_CMD_OPTS="--ansi --no-sort --layout=reverse $FZF_USER_OPTS"
 case $TUI_BACKEND in
   gum)
     if [[ -n "$SELECTED_LINE" ]]; then
-      COMMIT_LINE=$(echo "$RAW_OUTPUT" | gum choose --header "$HEADER" \
+      COMMIT_LINE=$(echo "$RAW_OUTPUT" | gum choose --no-strip-ansi --header "$HEADER" \
         --height 20 --selected "$SELECTED_LINE")
     else
-      COMMIT_LINE=$(echo "$RAW_OUTPUT" | gum choose --header "$HEADER" \
+      COMMIT_LINE=$(echo "$RAW_OUTPUT" | gum choose --no-strip-ansi --header "$HEADER" \
         --height 20)
     fi
     ;;
 
   gum_tmux)
-    GUM_CMD="gum choose --header '$HEADER'"
+    GUM_CMD="gum choose --no-strip-ansi --header '$HEADER'"
     if [[ -n "$SELECTED_LINE" ]]; then
       SAFE_SEL=$(echo "$SELECTED_LINE" | sed 's/"/\\"/g')
       GUM_CMD="$GUM_CMD --selected \"$SAFE_SEL\""
